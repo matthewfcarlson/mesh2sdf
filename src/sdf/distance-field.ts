@@ -29,24 +29,27 @@ const DEFAULT_CONFIG: DistanceFieldConfig = {
   padding: 0.1,
 };
 
+export interface VolumeInfo {
+  /** World-space bounds of the padded volume */
+  bounds: BoundingBox;
+  /** Size of one voxel in world units */
+  voxelSize: number;
+}
+
 /**
- * Compute a signed distance field from a triangle mesh.
+ * Compute the padded cubic volume bounds and voxel size for a mesh's bounding box.
+ * Creates a cube centered on the mesh with uniform padding.
  */
-export async function computeDistanceField(
-  ctx: GPUContext,
-  mesh: Mesh,
-  config: Partial<DistanceFieldConfig> = {}
-): Promise<DistanceField> {
-  const cfg = { ...DEFAULT_CONFIG, ...config };
-  const { device, queue } = ctx;
-
-  // Calculate volume bounds with padding
-  const meshCenter = boundsCenter(mesh.bounds);
-  const meshSize = boundsSize(mesh.bounds);
+export function computeVolumeBounds(
+  meshBounds: BoundingBox,
+  config: DistanceFieldConfig
+): VolumeInfo {
+  const meshCenter = boundsCenter(meshBounds);
+  const meshSize = boundsSize(meshBounds);
   const maxExtent = Math.max(meshSize.x, meshSize.y, meshSize.z);
-  const halfExtent = (maxExtent * (1 + cfg.padding)) / 2;
+  const halfExtent = (maxExtent * (1 + config.padding)) / 2;
 
-  const volumeBounds: BoundingBox = {
+  const bounds: BoundingBox = {
     min: {
       x: meshCenter.x - halfExtent,
       y: meshCenter.y - halfExtent,
@@ -59,7 +62,23 @@ export async function computeDistanceField(
     },
   };
 
-  const voxelSize = (halfExtent * 2) / cfg.resolution;
+  const voxelSize = (halfExtent * 2) / config.resolution;
+
+  return { bounds, voxelSize };
+}
+
+/**
+ * Compute a signed distance field from a triangle mesh.
+ */
+export async function computeDistanceField(
+  ctx: GPUContext,
+  mesh: Mesh,
+  config: Partial<DistanceFieldConfig> = {}
+): Promise<DistanceField> {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+  const { device, queue } = ctx;
+
+  const { bounds: volumeBounds, voxelSize } = computeVolumeBounds(mesh.bounds, cfg);
 
   // Create output 3D texture
   const texture = device.createTexture({
