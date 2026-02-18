@@ -23,3 +23,6 @@ npm-debug.log*
 # Cache
 .cache/
 *.tsbuildinfo
+
+# Screenshots (committed by CI only)
+screenshots/
