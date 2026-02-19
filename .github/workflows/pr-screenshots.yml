@@ -6,7 +6,7 @@ on:
 
 permissions:
   pull-requests: write
-  contents: write
+  contents: read
 
 jobs:
   screenshots:
@@ -14,8 +14,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -34,27 +32,20 @@ jobs:
       - name: Take screenshots
         run: node scripts/take-screenshots.mjs
 
-      - name: Commit and push screenshots
-        id: screenshots
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f screenshots/
-          git commit -m "Update PR screenshots [skip ci]" || echo "No changes to commit"
-          git push
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
       - name: Upload screenshots
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
           path: screenshots/
 
-      - name: Comment on PR
+      - name: Comment on PR with inline screenshots
         uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           script: |
             const fs = require('fs');
+            const path = require('path');
 
             const screenshotDir = 'screenshots';
             const files = fs.readdirSync(screenshotDir).filter(f => f.endsWith('.png'));
@@ -64,26 +55,89 @@ jobs:
               return;
             }
 
-            const sha = '${{ steps.screenshots.outputs.sha }}';
             const owner = context.repo.owner;
             const repo = context.repo.repo;
 
+            // Get repo ID needed for the upload API
+            const { data: repoData } = await github.rest.repos.get({ owner, repo });
+
+            const uploadedUrls = {};
+
+            for (const file of files) {
+              const filePath = path.join(screenshotDir, file);
+              const content = fs.readFileSync(filePath);
+              const stats = fs.statSync(filePath);
+
+              try {
+                // Step 1: Request an upload policy from GitHub's user-content storage
+                const policyRes = await fetch('https://github.com/upload/policies/assets', {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `token ${process.env.GITHUB_TOKEN}`,
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({
+                    name: file,
+                    size: stats.size,
+                    content_type: 'image/png',
+                    repository_id: repoData.id,
+                  }),
+                });
+
+                if (!policyRes.ok) {
+                  const text = await policyRes.text();
+                  throw new Error(`Policy request failed (${policyRes.status}): ${text}`);
+                }
+
+                const policy = await policyRes.json();
+
+                // Step 2: Upload the image to the signed URL
+                const form = new FormData();
+                for (const [key, value] of Object.entries(policy.form)) {
+                  form.append(key, value);
+                }
+                form.append('file', new Blob([content], { type: 'image/png' }), file);
+
+                const uploadRes = await fetch(policy.upload_url, {
+                  method: 'POST',
+                  body: form,
+                });
+
+                if (!uploadRes.ok) {
+                  throw new Error(`Upload failed (${uploadRes.status})`);
+                }
+
+                // Step 3: The asset href is the permanent, publicly-accessible URL
+                uploadedUrls[file] = policy.asset.href;
+                console.log(`Uploaded ${file} -> ${policy.asset.href}`);
+              } catch (err) {
+                console.log(`Warning: upload failed for ${file}: ${err.message}`);
+                uploadedUrls[file] = null;
+              }
+            }
+
+            // Build the comment body
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
             const imageMarkdown = files.map(f => {
               const name = f.replace('.png', '').replace(/-/g, ' ');
-              const url = `https://raw.githubusercontent.com/${owner}/${repo}/${sha}/screenshots/${f}`;
-              return `### ${name}\n![${name}](${url})`;
+              const url = uploadedUrls[f];
+              if (url) {
+                return `### ${name}\n![${name}](${url})`;
+              }
+              return `### ${name}\n*(upload failed — view in [artifacts](${runUrl}))*`;
             }).join('\n\n');
 
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
             const body = [
               '## App Screenshots',
               '',
               imageMarkdown,
               '',
-              `> Taken at ${new Date().toISOString()} | [View artifacts](${runUrl})`
+              `> Taken at ${new Date().toISOString()} | [Download all](${runUrl})`
             ].join('\n');
 
-            // Find existing bot comment to update
+            // Find existing bot comment to update (avoid duplicate comments)
             const { data: comments } = await github.rest.issues.listComments({
               owner,
               repo,
